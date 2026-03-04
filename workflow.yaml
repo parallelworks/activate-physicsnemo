@@ -47,7 +47,7 @@ jobs:
       - name: Clone Repository
         early-cancel: any-job-failed
         run: |
-          set -x
+          set -euxo pipefail
           RUNDIR="${{ inputs.advanced_settings.rundir }}"
           RUNDIR="${RUNDIR/#\~/$HOME}"
 
