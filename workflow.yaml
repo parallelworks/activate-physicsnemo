@@ -501,7 +501,7 @@ jobs:
             ignore: ${{ inputs.example.mode != 'custom' }}
             default: |
               #!/bin/bash
-              git clone --depth 1 https://github.com/NVIDIA/PhysicsNemo.git /workspace/PhysicsNemo
+              git clone --depth 1 --branch v1.1.0 https://github.com/NVIDIA/PhysicsNemo.git /workspace/PhysicsNemo
               cd /workspace/PhysicsNemo/examples/cfd/ldc_pinns
               python -u train.py
 
