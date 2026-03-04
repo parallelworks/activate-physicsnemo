@@ -326,49 +326,59 @@ jobs:
       remoteHost: ${{ inputs.resource.ip }}
     steps:
       - name: Start TensorBoard
-        early-cancel: any-job-failed
         run: |
           set -x
           cd ${{ needs.setup.outputs.rundir }}
           source lib/functions.sh
 
           TB_PORT="${{ inputs.tensorboard.port }}"
-          SESSION_NAME="${{ sessions.session }}"
-          SESSION_BASE_PATH="/me/session/${PW_USER}/${SESSION_NAME}"
+          DOCKER_IMAGE="${{ inputs.container.image }}"
+          CONTAINER_NAME="physicsnemo-tb-$$"
 
           # Create output dirs that TensorBoard will watch
           mkdir -p workspace/outputs logs
 
-          # Kill anything on our port
+          # Kill anything on our port and stale TB containers
           fuser -k "${TB_PORT}/tcp" 2>/dev/null || true
+          sudo docker rm -f $(sudo docker ps -aq --filter "name=physicsnemo-tb") 2>/dev/null || true
 
-          info "Starting TensorBoard on port ${TB_PORT}..."
+          info "Starting TensorBoard on port ${TB_PORT} via Docker..."
           info "  Watching: ${PWD}/workspace/outputs"
+          info "  Image: ${DOCKER_IMAGE}"
 
-          # Install and start TensorBoard directly (no Docker needed)
-          pip install tensorboard --quiet 2>/dev/null || pip3 install tensorboard --quiet 2>/dev/null || true
+          # Run TensorBoard in a Docker container using the same PhysicsNemo image
+          sudo docker run -d \
+            --name "${CONTAINER_NAME}" \
+            -p "${TB_PORT}:${TB_PORT}" \
+            -v "${PWD}/workspace/outputs:/workspace/outputs:ro" \
+            "${DOCKER_IMAGE}" \
+            tensorboard \
+              --logdir /workspace/outputs \
+              --port "${TB_PORT}" \
+              --bind_all \
+              --reload_interval 10 \
+            > logs/tensorboard_container.log 2>&1
 
-          nohup tensorboard \
-            --logdir "${PWD}/workspace/outputs" \
-            --port "${TB_PORT}" \
-            --bind_all \
-            --reload_interval 10 \
-            > logs/tensorboard.log 2>&1 &
-          TB_PID=$!
-          echo "kill $TB_PID 2>/dev/null || true" >> cancel.sh
-          echo "TB_PID=$TB_PID" >> $OUTPUTS
+          echo "sudo docker rm -f ${CONTAINER_NAME} 2>/dev/null || true" >> cancel.sh
+          echo "TB_CONTAINER=${CONTAINER_NAME}" >> $OUTPUTS
 
           # Wait for TensorBoard to be ready
           for i in $(seq 1 30); do
             if nc -z localhost "${TB_PORT}" 2>/dev/null; then
-              info "TensorBoard is ready on port ${TB_PORT} (PID: ${TB_PID})"
+              info "TensorBoard is ready on port ${TB_PORT} (container: ${CONTAINER_NAME})"
               exit 0
+            fi
+            # Check if container is still running
+            if ! sudo docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "${CONTAINER_NAME}"; then
+              error "TensorBoard container exited unexpectedly"
+              sudo docker logs "${CONTAINER_NAME}" 2>&1 | tail -20
+              exit 1
             fi
             sleep 2
           done
 
-          error "TensorBoard failed to start"
-          cat logs/tensorboard.log 2>/dev/null | tail -20 || true
+          error "TensorBoard failed to start within 60s"
+          sudo docker logs "${CONTAINER_NAME}" 2>&1 | tail -20
           exit 1
 
       - name: Update TensorBoard Session
@@ -391,20 +401,23 @@ jobs:
           echo "URL: https://${PW_PLATFORM_HOST}${basepath}/"
           echo "======================================"
 
-          # Stay alive until training completes and TensorBoard is stopped
+          # Stay alive until training completes and TensorBoard container stops
           while true; do
             if [[ -f job.ended ]]; then
               echo "Training complete. Keeping TensorBoard alive for 60s for final review..."
               sleep 60
               break
             fi
-            if ! nc -z localhost "${TB_PORT}" 2>/dev/null; then
-              echo "TensorBoard is no longer running on port ${TB_PORT}"
+            # Check if TB container is still running
+            if ! sudo docker ps --filter "name=physicsnemo-tb" --format '{{.Names}}' | grep -q physicsnemo-tb; then
+              echo "TensorBoard container is no longer running"
               break
             fi
             sleep 15
           done
 
+          # Clean up TB container
+          sudo docker rm -f $(sudo docker ps -aq --filter "name=physicsnemo-tb") 2>/dev/null || true
           echo "TensorBoard session ended"
 
 # ==============================================================================
