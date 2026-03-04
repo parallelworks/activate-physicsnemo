@@ -29,9 +29,19 @@ echo "========================================"
 
 START_TIME=$(date +%s)
 
+# Start TensorBoard metrics writer in background (writes TB events from training logs)
+TB_LOG_DIR="/workspace/outputs/tb_events" \
+  python3 /workspace/scripts/tb_metrics_writer.py &
+TB_WRITER_PID=$!
+echo "Started TB metrics writer (PID: $TB_WRITER_PID)"
+
 # Run the example (script is mounted read-only, use bash explicitly)
 bash "$EXAMPLE_SCRIPT"
 EXIT_CODE=$?
+
+# Stop metrics writer
+kill $TB_WRITER_PID 2>/dev/null || true
+wait $TB_WRITER_PID 2>/dev/null || true
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
