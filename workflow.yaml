@@ -438,23 +438,24 @@ jobs:
           echo "URL: https://${PW_PLATFORM_HOST}${basepath}/"
           echo "======================================"
 
-          # Stay alive until training completes and TensorBoard container stops
+          # Stay alive until training completes
           while true; do
             if [[ -f job.ended ]]; then
               echo "Training complete. Keeping TensorBoard alive for 60s for final review..."
               sleep 60
               break
             fi
-            # Check if TB container is still running
-            if ! sudo docker ps --filter "name=tb-session" --format '{{.Names}}' | grep -q tb-session; then
-              echo "TensorBoard container is no longer running"
+            # Check if proxy is still listening (proxy is on the host, not in container)
+            if ! nc -z localhost "${TB_PORT}" 2>/dev/null; then
+              echo "TensorBoard proxy is no longer running on port ${TB_PORT}"
               break
             fi
             sleep 15
           done
 
-          # Clean up TB container
+          # Clean up
           sudo docker rm -f $(sudo docker ps -aq --filter "name=tb-session") 2>/dev/null || true
+          pkill -f "tb_proxy.py" 2>/dev/null || true
           echo "TensorBoard session ended"
 
 # ==============================================================================
