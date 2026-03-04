@@ -333,7 +333,6 @@ jobs:
           source lib/functions.sh
 
           TB_PORT="${{ inputs.tensorboard.port }}"
-          GPU_ID="${{ inputs.training.gpu_id }}"
           SESSION_NAME="${{ sessions.session }}"
           SESSION_BASE_PATH="/me/session/${PW_USER}/${SESSION_NAME}"
 
@@ -343,55 +342,33 @@ jobs:
           # Kill anything on our port
           fuser -k "${TB_PORT}/tcp" 2>/dev/null || true
 
-          # Determine docker command
-          DOCKER_CMD="docker"
-          if ! docker ps >/dev/null 2>&1; then
-            if sudo -n true 2>/dev/null; then
-              DOCKER_CMD="sudo docker"
-            fi
-          fi
-
-          IMAGE="${{ inputs.container.docker_image }}"
-
           info "Starting TensorBoard on port ${TB_PORT}..."
-          info "  Session base path: ${SESSION_BASE_PATH}"
-          info "  Watching: /workspace/outputs"
+          info "  Watching: ${PWD}/workspace/outputs"
 
-          # Start TensorBoard in a Docker container (no GPU needed)
-          $DOCKER_CMD run -d \
-            --name "physicsnemo-tb-$$" \
-            --rm \
-            -p "${TB_PORT}:${TB_PORT}" \
-            -v "${PWD}/workspace:/workspace" \
-            "$IMAGE" \
-            tensorboard \
-              --logdir /workspace/outputs \
-              --port "${TB_PORT}" \
-              --bind_all \
-              --path_prefix "${SESSION_BASE_PATH}" \
-              --reload_interval 10
+          # Install and start TensorBoard directly (no Docker needed)
+          pip install tensorboard --quiet 2>/dev/null || pip3 install tensorboard --quiet 2>/dev/null || true
 
-          # Add to cancel script
-          echo "$DOCKER_CMD rm -f physicsnemo-tb-$$ 2>/dev/null || true" >> cancel.sh
+          nohup tensorboard \
+            --logdir "${PWD}/workspace/outputs" \
+            --port "${TB_PORT}" \
+            --bind_all \
+            --reload_interval 10 \
+            > logs/tensorboard.log 2>&1 &
+          TB_PID=$!
+          echo "kill $TB_PID 2>/dev/null || true" >> cancel.sh
+          echo "TB_PID=$TB_PID" >> $OUTPUTS
 
           # Wait for TensorBoard to be ready
           for i in $(seq 1 30); do
-            if curl -s -o /dev/null -w "%{http_code}" "http://localhost:${TB_PORT}${SESSION_BASE_PATH}/" 2>/dev/null | grep -q "200\|302"; then
-              info "TensorBoard is ready on port ${TB_PORT}"
+            if nc -z localhost "${TB_PORT}" 2>/dev/null; then
+              info "TensorBoard is ready on port ${TB_PORT} (PID: ${TB_PID})"
               exit 0
             fi
             sleep 2
           done
 
-          # Even if health check doesn't pass, TensorBoard may still work
-          # (it returns 200 only after event files appear)
-          if nc -z localhost "${TB_PORT}" 2>/dev/null; then
-            info "TensorBoard is listening on port ${TB_PORT} (waiting for training data)"
-            exit 0
-          fi
-
           error "TensorBoard failed to start"
-          $DOCKER_CMD logs "physicsnemo-tb-$$" 2>&1 | tail -20 || true
+          cat logs/tensorboard.log 2>/dev/null | tail -20 || true
           exit 1
 
       - name: Update TensorBoard Session
