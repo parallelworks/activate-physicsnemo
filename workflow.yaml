@@ -339,19 +339,18 @@ jobs:
           mkdir -p workspace/outputs logs
 
           # Kill anything on our port and stale TB containers/processes
+          pkill -f "tensorboard.*--port" 2>/dev/null || true
           fuser -k "${TB_PORT}/tcp" 2>/dev/null || true
-          sleep 1
+          sleep 2
           fuser -k -9 "${TB_PORT}/tcp" 2>/dev/null || true
           sudo docker rm -f $(sudo docker ps -aq --filter "name=physicsnemo-tb") 2>/dev/null || true
-          # Also kill any stale tensorboard processes on the host
-          pkill -f "tensorboard.*--port" 2>/dev/null || true
+          sleep 1
 
           info "Starting TensorBoard on port ${TB_PORT} via Docker..."
           info "  Watching: ${PWD}/workspace/outputs"
           info "  Image: ${DOCKER_IMAGE}"
 
           # Run TensorBoard in a Docker container with host networking
-          # to avoid port mapping conflicts with the training container
           sudo docker run -d \
             --name "${CONTAINER_NAME}" \
             --network host \
@@ -367,17 +366,22 @@ jobs:
           echo "sudo docker rm -f ${CONTAINER_NAME} 2>/dev/null || true" >> cancel.sh
           echo "TB_CONTAINER=${CONTAINER_NAME}" >> $OUTPUTS
 
-          # Wait for TensorBoard to be ready
+          # Wait for TensorBoard to be ready (check both container and port)
           for i in $(seq 1 30); do
-            if nc -z localhost "${TB_PORT}" 2>/dev/null; then
-              info "TensorBoard is ready on port ${TB_PORT} (container: ${CONTAINER_NAME})"
-              exit 0
-            fi
-            # Check if container is still running
+            # First verify container is still running
             if ! sudo docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "${CONTAINER_NAME}"; then
               error "TensorBoard container exited unexpectedly"
               sudo docker logs "${CONTAINER_NAME}" 2>&1 | tail -20
               exit 1
+            fi
+            # Then check if port is ready
+            if nc -z localhost "${TB_PORT}" 2>/dev/null; then
+              # Double check container is still alive (not a false positive from another process)
+              sleep 1
+              if sudo docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "${CONTAINER_NAME}"; then
+                info "TensorBoard is ready on port ${TB_PORT} (container: ${CONTAINER_NAME})"
+                exit 0
+              fi
             fi
             sleep 2
           done
