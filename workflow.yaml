@@ -333,7 +333,7 @@ jobs:
 
           TB_PORT="${{ inputs.tensorboard.port }}"
           DOCKER_IMAGE="${{ inputs.container.image }}"
-          CONTAINER_NAME="physicsnemo-tb-$$"
+          CONTAINER_NAME="tb-session-$$"
 
           # Create output dirs that TensorBoard will watch
           mkdir -p workspace/outputs logs
@@ -343,7 +343,7 @@ jobs:
           fuser -k "${TB_PORT}/tcp" 2>/dev/null || true
           sleep 2
           fuser -k -9 "${TB_PORT}/tcp" 2>/dev/null || true
-          sudo docker rm -f $(sudo docker ps -aq --filter "name=physicsnemo-tb") 2>/dev/null || true
+          sudo docker rm -f $(sudo docker ps -aq --filter "name=tb-session") 2>/dev/null || true
           sleep 1
 
           info "Starting TensorBoard on port ${TB_PORT} via Docker..."
@@ -418,7 +418,7 @@ jobs:
               break
             fi
             # Check if TB container is still running
-            if ! sudo docker ps --filter "name=physicsnemo-tb" --format '{{.Names}}' | grep -q physicsnemo-tb; then
+            if ! sudo docker ps --filter "name=tb-session" --format '{{.Names}}' | grep -q tb-session; then
               echo "TensorBoard container is no longer running"
               break
             fi
@@ -426,7 +426,7 @@ jobs:
           done
 
           # Clean up TB container
-          sudo docker rm -f $(sudo docker ps -aq --filter "name=physicsnemo-tb") 2>/dev/null || true
+          sudo docker rm -f $(sudo docker ps -aq --filter "name=tb-session") 2>/dev/null || true
           echo "TensorBoard session ended"
 
 # ==============================================================================
