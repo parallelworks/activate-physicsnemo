@@ -236,7 +236,6 @@ jobs:
     steps:
       - name: Run Example
         uses: marketplace/job_runner/v4.0
-        early-cancel: any-job-failed
         with:
           resource: ${{ inputs.resource }}
           shebang: '#!/bin/bash'
@@ -263,58 +262,6 @@ jobs:
             select: ${{ inputs.pbs.select }}
             scheduler_directives: |
               ${{ inputs.pbs.scheduler_directives }}
-
-  # ============================================================================
-  # Collect Outputs
-  # ============================================================================
-  collect_outputs:
-    needs: [setup, run_example]
-    if: always()
-    ssh:
-      remoteHost: ${{ inputs.resource.ip }}
-    steps:
-      - name: Collect Outputs
-        run: |
-          set -x
-          cd ${{ needs.setup.outputs.rundir }}
-          source lib/functions.sh
-
-          OUTPUT_DIR="workspace/outputs"
-          COLLECT_DIR="outputs"
-          mkdir -p "$COLLECT_DIR"
-
-          if [[ ! -d "$OUTPUT_DIR" ]]; then
-            warn "No output directory found at $OUTPUT_DIR"
-            exit 0
-          fi
-
-          info "Collecting outputs from $OUTPUT_DIR..."
-
-          # Copy plots and visualizations
-          find "$OUTPUT_DIR" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" \) -exec cp {} "$COLLECT_DIR/" \; 2>/dev/null || true
-
-          # Copy metrics and configs
-          find "$OUTPUT_DIR" -type f \( -name "*.csv" -o -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) -exec cp {} "$COLLECT_DIR/" \; 2>/dev/null || true
-
-          # Copy summary
-          [[ -f "$OUTPUT_DIR/summary.txt" ]] && cp "$OUTPUT_DIR/summary.txt" "$COLLECT_DIR/"
-
-          # List checkpoint files (don't copy - they're multi-GB)
-          echo "" >> "$COLLECT_DIR/summary.txt"
-          echo "Checkpoint files (not copied):" >> "$COLLECT_DIR/summary.txt"
-          find "$OUTPUT_DIR" -type f \( -name "*.pt" -o -name "*.pth" -o -name "*.ckpt" \) -printf "  %s\t%p\n" >> "$COLLECT_DIR/summary.txt" 2>/dev/null || true
-
-          # Show what we collected
-          info "Collected outputs:"
-          ls -la "$COLLECT_DIR/" 2>/dev/null || true
-
-          if [[ -f "$COLLECT_DIR/summary.txt" ]]; then
-            echo ""
-            echo "=== Training Summary ==="
-            cat "$COLLECT_DIR/summary.txt"
-          fi
-
-          info "Output collection complete"
 
   # ============================================================================
   # TensorBoard Session (runs in parallel with training)
