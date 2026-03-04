@@ -338,18 +338,23 @@ jobs:
           # Create output dirs that TensorBoard will watch
           mkdir -p workspace/outputs logs
 
-          # Kill anything on our port and stale TB containers
+          # Kill anything on our port and stale TB containers/processes
           fuser -k "${TB_PORT}/tcp" 2>/dev/null || true
+          sleep 1
+          fuser -k -9 "${TB_PORT}/tcp" 2>/dev/null || true
           sudo docker rm -f $(sudo docker ps -aq --filter "name=physicsnemo-tb") 2>/dev/null || true
+          # Also kill any stale tensorboard processes on the host
+          pkill -f "tensorboard.*--port" 2>/dev/null || true
 
           info "Starting TensorBoard on port ${TB_PORT} via Docker..."
           info "  Watching: ${PWD}/workspace/outputs"
           info "  Image: ${DOCKER_IMAGE}"
 
-          # Run TensorBoard in a Docker container using the same PhysicsNemo image
+          # Run TensorBoard in a Docker container with host networking
+          # to avoid port mapping conflicts with the training container
           sudo docker run -d \
             --name "${CONTAINER_NAME}" \
-            -p "${TB_PORT}:${TB_PORT}" \
+            --network host \
             -v "${PWD}/workspace/outputs:/workspace/outputs:ro" \
             "${DOCKER_IMAGE}" \
             tensorboard \
