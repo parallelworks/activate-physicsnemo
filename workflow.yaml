@@ -119,6 +119,10 @@ jobs:
             error "Docker is not installed"
             ERRORS=$((ERRORS + 1))
           else
+            # Try to start docker daemon if we have sudo
+            if sudo -n true 2>/dev/null; then
+              sudo systemctl start docker 2>/dev/null || true
+            fi
             if docker ps >/dev/null 2>&1 || sudo -n docker ps >/dev/null 2>&1; then
               info "Docker is accessible"
             else
@@ -190,12 +194,15 @@ jobs:
           IMAGE="${{ inputs.container.docker_image }}"
           info "Pulling container image: $IMAGE"
 
-          # Determine docker command
+          # Determine docker command - prefer sudo for pull reliability
           DOCKER_CMD="docker"
-          if ! docker ps >/dev/null 2>&1; then
-            if sudo -n true 2>/dev/null; then
-              DOCKER_CMD="sudo docker"
-            fi
+          if sudo -n docker ps >/dev/null 2>&1; then
+            DOCKER_CMD="sudo docker"
+            # Ensure docker daemon is running
+            sudo systemctl start docker 2>/dev/null || true
+          elif ! docker ps >/dev/null 2>&1; then
+            error "Docker is not accessible"
+            exit 1
           fi
 
           # Check if image already exists
