@@ -15,8 +15,10 @@ if [[ ! -f "$EXAMPLE_SCRIPT" ]]; then
     exit 1
 fi
 
-# Create outputs directory
+# Create outputs directory and clean stale TB events from previous runs
 mkdir -p /workspace/outputs
+rm -rf /workspace/outputs/tb_events 2>/dev/null || true
+mkdir -p /workspace/outputs/tb_events
 
 echo "========================================"
 echo "  PhysicsNemo Example: $EXAMPLE_NAME"

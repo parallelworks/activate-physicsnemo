@@ -269,11 +269,11 @@ jobs:
   # ============================================================================
   collect_outputs:
     needs: [setup, run_example]
+    if: always()
     ssh:
       remoteHost: ${{ inputs.resource.ip }}
     steps:
       - name: Collect Outputs
-        early-cancel: any-job-failed
         run: |
           set -x
           cd ${{ needs.setup.outputs.rundir }}
