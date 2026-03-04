@@ -6,7 +6,7 @@ set -euo pipefail
 
 NEMO_DIR="/workspace/PhysicsNemo"
 [[ -d "$NEMO_DIR" ]] && rm -rf "$NEMO_DIR"
-git clone --depth 1 https://github.com/NVIDIA/PhysicsNemo.git "$NEMO_DIR"
+git clone --depth 1 --branch v1.1.0 https://github.com/NVIDIA/PhysicsNemo.git "$NEMO_DIR"
 
 cd "$NEMO_DIR/examples/cfd/ldc_pinns"
 
