@@ -1,0 +1,22 @@
+# Runtime artifacts
+logs/
+*.log
+job.started
+job.ended
+HOSTNAME
+jobid
+cancel.sh
+.run.env
+
+# Outputs
+outputs/
+workspace/
+
+# Docker
+docker-rootless.log
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~

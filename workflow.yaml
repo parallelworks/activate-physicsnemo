@@ -1,0 +1,723 @@
+# yaml-language-server: $schema=https://activate.parallel.works/workflow.schema.json
+---
+# ==============================================================================
+# ACTIVATE PhysicsNemo Training Workflow
+# ==============================================================================
+# Runs NVIDIA PhysicsNemo examples in Docker containers on GPU clusters.
+#
+# Features:
+#   - Curated examples tuned for A30 24GB GPUs (FNO, PINNs, RNN, PINO, GNN)
+#   - Custom script mode for advanced users
+#   - Pre-flight GPU and Docker health checks
+#   - Automatic output collection (plots, metrics, configs)
+#   - Unified SLURM/PBS/SSH job submission via job_runner marketplace action
+#
+# Organized Input Sections:
+#   1. Resource Selection          - Compute cluster target
+#   2. Scheduler Options           - SLURM/PBS configuration for HPC execution
+#   3. Example Selection           - Curated examples or custom script
+#   4. Training Settings           - Epoch/batch overrides, GPU selection
+#   5. Container Options           - Docker image, run mode
+#   6. SLURM/PBS Config            - Scheduler-specific parameters
+#   7. Advanced Settings           - Run directory, repository, branch
+#
+# Usage:
+#   Select a curated example for turnkey training, or paste a custom script.
+#   Outputs (plots, metrics) are collected to the workspace/outputs directory.
+# ==============================================================================
+
+permissions:
+  - '*'
+sessions:
+  session:
+    useTLS: false
+    redirect: false
+
+# ==============================================================================
+# JOB DEFINITIONS
+# ==============================================================================
+jobs:
+  # ============================================================================
+  # Setup: Clone Repository and Create Environment
+  # ============================================================================
+  setup:
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
+    steps:
+      - name: Clone Repository
+        early-cancel: any-job-failed
+        run: |
+          set -x
+          RUNDIR="${{ inputs.advanced_settings.rundir }}"
+          RUNDIR="${RUNDIR/#\~/$HOME}"
+
+          mkdir -p "$(dirname $RUNDIR)"
+
+          if [[ -d "$RUNDIR/.git" ]]; then
+            echo "Repository exists, updating..."
+            cd "$RUNDIR"
+            git fetch origin
+            git checkout ${{ inputs.advanced_settings.repository_branch }}
+            git reset --hard origin/${{ inputs.advanced_settings.repository_branch }}
+          else
+            echo "Cloning fresh repository..."
+            git clone -b ${{ inputs.advanced_settings.repository_branch }} ${{ inputs.advanced_settings.repository }} "$RUNDIR"
+          fi
+
+          cd "$RUNDIR"
+          rm -f jobid job.started job.ended HOSTNAME
+          rm -rf logs
+
+          echo "rundir=$RUNDIR" >> $OUTPUTS
+
+      - name: Create Environment File
+        id: create_env
+        early-cancel: any-job-failed
+        run: |
+          set -x
+          cd ${{ needs.setup.outputs.rundir }}
+
+          cat > .run.env << 'ENVEOF'
+          export RUNMODE=${{ inputs.container.runmode }}
+          export EXAMPLE_MODE=${{ inputs.example.mode }}
+          export EXAMPLE_NAME=${{ inputs.example.curated_example }}
+          export DOCKER_IMAGE=${{ inputs.container.docker_image }}
+          export GPU_ID=${{ inputs.training.gpu_id }}
+          export MAX_EPOCHS=${{ inputs.training.max_epochs }}
+          export BATCH_SIZE=${{ inputs.training.batch_size }}
+          ENVEOF
+
+          # Write custom script if in custom mode
+          if [[ "${{ inputs.example.mode }}" == "custom" ]]; then
+            mkdir -p workspace
+            echo "${{ inputs.example.custom_script }}" > workspace/custom.sh
+            chmod +x workspace/custom.sh
+          fi
+
+          echo "Environment file created"
+
+  # ============================================================================
+  # Preflight: Validate GPU, Docker, and Disk
+  # ============================================================================
+  preflight:
+    needs: [setup]
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
+    steps:
+      - name: Preflight Checks
+        early-cancel: any-job-failed
+        run: |
+          set -x
+          cd ${{ needs.setup.outputs.rundir }}
+          source lib/functions.sh
+
+          ERRORS=0
+
+          # Check Docker
+          info "Checking Docker..."
+          if ! command -v docker >/dev/null 2>&1; then
+            error "Docker is not installed"
+            ERRORS=$((ERRORS + 1))
+          else
+            if docker ps >/dev/null 2>&1 || sudo -n docker ps >/dev/null 2>&1; then
+              info "Docker is accessible"
+            else
+              warn "Docker is installed but not accessible (may need sudo or rootless setup)"
+            fi
+          fi
+
+          # Check GPU
+          info "Checking GPU..."
+          if ! command -v nvidia-smi >/dev/null 2>&1; then
+            error "nvidia-smi not found - no GPU support detected"
+            ERRORS=$((ERRORS + 1))
+          else
+            GPU_COUNT=$(detect_gpu_count)
+            GPU_ID="${{ inputs.training.gpu_id }}"
+            info "Found $GPU_COUNT GPU(s)"
+
+            if [[ $GPU_ID -ge $GPU_COUNT ]]; then
+              error "Requested GPU $GPU_ID but only $GPU_COUNT GPU(s) available"
+              ERRORS=$((ERRORS + 1))
+            else
+              GPU_NAME=$(get_gpu_name "$GPU_ID")
+              FREE_MEM=$(get_gpu_free_memory "$GPU_ID")
+              info "GPU $GPU_ID: $GPU_NAME with ${FREE_MEM}MiB free"
+
+              if [[ $FREE_MEM -lt 8000 ]]; then
+                warn "GPU $GPU_ID has only ${FREE_MEM}MiB free (recommend >= 8GB). Another process may be using the GPU."
+                nvidia-smi
+              fi
+            fi
+          fi
+
+          # Kill stale PhysicsNemo containers
+          info "Checking for stale containers..."
+          kill_stale_containers "physicsnemo"
+
+          # Check disk space (need ~20GB for container image)
+          info "Checking disk space..."
+          AVAIL_KB=$(df -k . | tail -1 | awk '{print $4}')
+          AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
+          if [[ $AVAIL_GB -lt 20 ]]; then
+            warn "Only ${AVAIL_GB}GB disk space available (recommend >= 20GB for container image)"
+          else
+            info "Disk space: ${AVAIL_GB}GB available"
+          fi
+
+          if [[ $ERRORS -gt 0 ]]; then
+            error "Preflight failed with $ERRORS error(s)"
+            exit 1
+          fi
+
+          info "Preflight checks passed"
+
+  # ============================================================================
+  # Pull Container Image
+  # ============================================================================
+  pull_container:
+    needs: [setup, preflight]
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
+    steps:
+      - name: Pull Docker Image
+        early-cancel: any-job-failed
+        run: |
+          set -x
+          cd ${{ needs.setup.outputs.rundir }}
+          source lib/functions.sh
+
+          IMAGE="${{ inputs.container.docker_image }}"
+          info "Pulling container image: $IMAGE"
+
+          # Determine docker command
+          DOCKER_CMD="docker"
+          if ! docker ps >/dev/null 2>&1; then
+            if sudo -n true 2>/dev/null; then
+              DOCKER_CMD="sudo docker"
+            fi
+          fi
+
+          # Check if image already exists
+          if $DOCKER_CMD image inspect "$IMAGE" >/dev/null 2>&1; then
+            info "Image already available locally"
+          else
+            info "Downloading image (this may take a while)..."
+            $DOCKER_CMD pull "$IMAGE" || {
+              error "Failed to pull image: $IMAGE"
+              exit 1
+            }
+          fi
+
+          info "Container image ready"
+
+  # ============================================================================
+  # Run Example (using marketplace job_runner)
+  # ============================================================================
+  run_example:
+    needs: [setup, preflight, pull_container]
+    working-directory: ${{ needs.setup.outputs.rundir }}
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
+    steps:
+      - name: Run Example
+        uses: marketplace/job_runner/v4.0
+        early-cancel: any-job-failed
+        with:
+          resource: ${{ inputs.resource }}
+          shebang: '#!/bin/bash'
+          rundir: ${{ needs.setup.outputs.rundir }}
+          use_existing_script: true
+          script_path: ${{ needs.setup.outputs.rundir + '/start_service.sh' }}
+          scheduler: ${{ inputs.submit_to_scheduler }}
+          inject_markers: true
+          slurm:
+            is_disabled: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+            account: ${{ inputs.slurm.account }}
+            partition: ${{ inputs.slurm.partition }}
+            qos: ${{ inputs.slurm.qos }}
+            time: ${{ inputs.slurm.time }}
+            cpus_per_task: ${{ inputs.slurm.cpus_per_task }}
+            gres: ${{ inputs.slurm.gres }}
+            scheduler_directives: |
+              ${{ inputs.slurm.scheduler_directives }}
+          pbs:
+            is_disabled: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+            account: ${{ inputs.pbs.account }}
+            queue: ${{ inputs.pbs.queue }}
+            walltime: ${{ inputs.pbs.walltime }}
+            select: ${{ inputs.pbs.select }}
+            scheduler_directives: |
+              ${{ inputs.pbs.scheduler_directives }}
+
+  # ============================================================================
+  # Collect Outputs
+  # ============================================================================
+  collect_outputs:
+    needs: [setup, run_example]
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
+    steps:
+      - name: Collect Outputs
+        early-cancel: any-job-failed
+        run: |
+          set -x
+          cd ${{ needs.setup.outputs.rundir }}
+          source lib/functions.sh
+
+          OUTPUT_DIR="workspace/outputs"
+          COLLECT_DIR="outputs"
+          mkdir -p "$COLLECT_DIR"
+
+          if [[ ! -d "$OUTPUT_DIR" ]]; then
+            warn "No output directory found at $OUTPUT_DIR"
+            exit 0
+          fi
+
+          info "Collecting outputs from $OUTPUT_DIR..."
+
+          # Copy plots and visualizations
+          find "$OUTPUT_DIR" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" \) -exec cp {} "$COLLECT_DIR/" \; 2>/dev/null || true
+
+          # Copy metrics and configs
+          find "$OUTPUT_DIR" -type f \( -name "*.csv" -o -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) -exec cp {} "$COLLECT_DIR/" \; 2>/dev/null || true
+
+          # Copy summary
+          [[ -f "$OUTPUT_DIR/summary.txt" ]] && cp "$OUTPUT_DIR/summary.txt" "$COLLECT_DIR/"
+
+          # List checkpoint files (don't copy - they're multi-GB)
+          echo "" >> "$COLLECT_DIR/summary.txt"
+          echo "Checkpoint files (not copied):" >> "$COLLECT_DIR/summary.txt"
+          find "$OUTPUT_DIR" -type f \( -name "*.pt" -o -name "*.pth" -o -name "*.ckpt" \) -printf "  %s\t%p\n" >> "$COLLECT_DIR/summary.txt" 2>/dev/null || true
+
+          # Show what we collected
+          info "Collected outputs:"
+          ls -la "$COLLECT_DIR/" 2>/dev/null || true
+
+          if [[ -f "$COLLECT_DIR/summary.txt" ]]; then
+            echo ""
+            echo "=== Training Summary ==="
+            cat "$COLLECT_DIR/summary.txt"
+          fi
+
+          info "Output collection complete"
+
+  # ============================================================================
+  # TensorBoard Session (runs in parallel with training)
+  # ============================================================================
+  tensorboard_session:
+    needs: [setup, pull_container]
+    if: ${{ inputs.tensorboard.enabled }}
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
+    steps:
+      - name: Start TensorBoard
+        early-cancel: any-job-failed
+        run: |
+          set -x
+          cd ${{ needs.setup.outputs.rundir }}
+          source lib/functions.sh
+
+          TB_PORT="${{ inputs.tensorboard.port }}"
+          GPU_ID="${{ inputs.training.gpu_id }}"
+          SESSION_NAME="${{ sessions.session }}"
+          SESSION_BASE_PATH="/me/session/${PW_USER}/${SESSION_NAME}"
+
+          # Create output dirs that TensorBoard will watch
+          mkdir -p workspace/outputs logs
+
+          # Kill anything on our port
+          fuser -k "${TB_PORT}/tcp" 2>/dev/null || true
+
+          # Determine docker command
+          DOCKER_CMD="docker"
+          if ! docker ps >/dev/null 2>&1; then
+            if sudo -n true 2>/dev/null; then
+              DOCKER_CMD="sudo docker"
+            fi
+          fi
+
+          IMAGE="${{ inputs.container.docker_image }}"
+
+          info "Starting TensorBoard on port ${TB_PORT}..."
+          info "  Session base path: ${SESSION_BASE_PATH}"
+          info "  Watching: /workspace/outputs"
+
+          # Start TensorBoard in a Docker container (no GPU needed)
+          $DOCKER_CMD run -d \
+            --name "physicsnemo-tb-$$" \
+            --rm \
+            -p "${TB_PORT}:${TB_PORT}" \
+            -v "${PWD}/workspace:/workspace" \
+            "$IMAGE" \
+            tensorboard \
+              --logdir /workspace/outputs \
+              --port "${TB_PORT}" \
+              --bind_all \
+              --path_prefix "${SESSION_BASE_PATH}" \
+              --reload_interval 10
+
+          # Add to cancel script
+          echo "$DOCKER_CMD rm -f physicsnemo-tb-$$ 2>/dev/null || true" >> cancel.sh
+
+          # Wait for TensorBoard to be ready
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null -w "%{http_code}" "http://localhost:${TB_PORT}${SESSION_BASE_PATH}/" 2>/dev/null | grep -q "200\|302"; then
+              info "TensorBoard is ready on port ${TB_PORT}"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          # Even if health check doesn't pass, TensorBoard may still work
+          # (it returns 200 only after event files appear)
+          if nc -z localhost "${TB_PORT}" 2>/dev/null; then
+            info "TensorBoard is listening on port ${TB_PORT} (waiting for training data)"
+            exit 0
+          fi
+
+          error "TensorBoard failed to start"
+          $DOCKER_CMD logs "physicsnemo-tb-$$" 2>&1 | tail -20 || true
+          exit 1
+
+      - name: Update TensorBoard Session
+        uses: parallelworks/update-session
+        with:
+          remoteHost: ${{ inputs.resource.ip }}
+          remotePort: ${{ inputs.tensorboard.port }}
+          name: ${{ sessions.session }}
+          status: running
+          target: ${{ inputs.resource.id }}
+
+      - name: Keep TensorBoard Alive
+        run: |
+          TB_PORT="${{ inputs.tensorboard.port }}"
+          basepath="/me/session/${PW_USER}/${{ sessions.session }}"
+          cd ${{ needs.setup.outputs.rundir }}
+
+          echo "======================================"
+          echo "TensorBoard session is active"
+          echo "URL: https://${PW_PLATFORM_HOST}${basepath}/"
+          echo "======================================"
+
+          # Stay alive until training completes and TensorBoard is stopped
+          while true; do
+            if [[ -f job.ended ]]; then
+              echo "Training complete. Keeping TensorBoard alive for 60s for final review..."
+              sleep 60
+              break
+            fi
+            if ! nc -z localhost "${TB_PORT}" 2>/dev/null; then
+              echo "TensorBoard is no longer running on port ${TB_PORT}"
+              break
+            fi
+            sleep 15
+          done
+
+          echo "TensorBoard session ended"
+
+# ==============================================================================
+# INPUT DEFINITIONS
+# ==============================================================================
+'on':
+  execute:
+    inputs:
+      # ========================================================================
+      # Resource Selection
+      # ========================================================================
+      resource:
+        type: compute-clusters
+        label: GPU Cluster
+        autoselect: true
+        include-workspace: false
+        tooltip: GPU-enabled resource to run PhysicsNemo training
+
+      # ========================================================================
+      # Scheduler Submission
+      # ========================================================================
+      submit_to_scheduler:
+        type: boolean
+        label: Submit to Job Scheduler
+        tooltip: Enable to submit job via SLURM or PBS scheduler. Disable for direct SSH execution.
+        default: false
+        hidden: ${{ inputs.resource.schedulerType != 'slurm' && inputs.resource.schedulerType != 'pbs' }}
+
+      # ========================================================================
+      # Example Selection
+      # ========================================================================
+      example:
+        type: group
+        label: Example Selection
+        items:
+          mode:
+            type: dropdown
+            label: Mode
+            default: curated
+            tooltip: Run a curated example or provide your own script
+            options:
+              - value: curated
+                label: Curated Example
+              - value: custom
+                label: Custom Script
+
+          curated_example:
+            type: dropdown
+            label: Example
+            default: darcy_fno
+            tooltip: Select a PhysicsNemo example to run
+            hidden: ${{ inputs.example.mode != 'curated' }}
+            ignore: ${{ inputs.example.mode != 'curated' }}
+            options:
+              - value: darcy_fno
+                label: "Darcy Flow (FNO) - fast training, generates data on-the-fly"
+              - value: ldc_pinns
+                label: "Lid-Driven Cavity (PINNs) - physics-only, no data needed"
+              - value: gray_scott_rnn
+                label: "Gray-Scott RNN - 3D reaction-diffusion patterns"
+              - value: darcy_physics_informed
+                label: "Darcy Flow (PINO) - data + physics combined"
+              - value: vortex_shedding_mesh_reduced
+                label: "Vortex Shedding (MeshGraphNet) - animated flow"
+
+          custom_script:
+            type: editor
+            label: Custom Script
+            tooltip: Bash script to run inside the PhysicsNemo container. Working directory is /workspace.
+            hidden: ${{ inputs.example.mode != 'custom' }}
+            ignore: ${{ inputs.example.mode != 'custom' }}
+            default: |
+              #!/bin/bash
+              git clone --depth 1 https://github.com/NVIDIA/PhysicsNemo.git /workspace/PhysicsNemo
+              cd /workspace/PhysicsNemo/examples/cfd/ldc_pinns
+              python -u train.py
+
+      # ========================================================================
+      # Training Settings
+      # ========================================================================
+      training:
+        type: group
+        label: Training Settings
+        collapsed: true
+        hidden: ${{ inputs.example.mode != 'curated' }}
+        items:
+          max_epochs:
+            type: number
+            label: Max Epochs Override
+            default: 0
+            min: 0
+            tooltip: Override max training epochs (0 = use example default)
+
+          batch_size:
+            type: number
+            label: Batch Size Override
+            default: 0
+            min: 0
+            tooltip: Override training batch size (0 = use example default)
+
+          gpu_id:
+            type: number
+            label: GPU ID
+            default: 0
+            min: 0
+            max: 7
+            tooltip: GPU device index to use (0-based). Use nvidia-smi to check available GPUs.
+
+      # ========================================================================
+      # TensorBoard Monitoring
+      # ========================================================================
+      tensorboard:
+        type: group
+        label: TensorBoard Monitoring
+        collapsed: true
+        items:
+          enabled:
+            label: Enable TensorBoard
+            type: boolean
+            default: true
+            tooltip: Launch TensorBoard to visualize training metrics in real-time
+
+          port:
+            label: TensorBoard Port
+            type: number
+            default: 6006
+            optional: true
+            tooltip: Port for TensorBoard web UI
+            hidden: ${{ !inputs.tensorboard.enabled }}
+
+      # ========================================================================
+      # Container Options
+      # ========================================================================
+      container:
+        type: group
+        label: Container Options
+        collapsed: true
+        items:
+          docker_image:
+            type: string
+            label: Docker Image
+            default: nvcr.io/nvidia/physicsnemo/physicsnemo:25.11
+            prefillDefault: true
+            tooltip: PhysicsNemo container image to use
+
+          runmode:
+            type: dropdown
+            label: Docker Run Mode
+            default: docker
+            tooltip: Use sudo docker or rootless docker
+            options:
+              - value: docker
+                label: Docker (sudo)
+              - value: rootless
+                label: Rootless Docker
+
+      # ========================================================================
+      # SLURM Configuration
+      # ========================================================================
+      slurm:
+        type: group
+        label: SLURM Configuration
+        hidden: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+        collapsed: true
+        items:
+          is_disabled:
+            type: boolean
+            default: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+            hidden: true
+
+          account:
+            label: Account
+            type: slurm-accounts
+            resource: ${{ inputs.resource }}
+            tooltip: SLURM account for job submission (--account)
+            optional: true
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+
+          partition:
+            type: slurm-partitions
+            label: Partition
+            optional: true
+            resource: ${{ inputs.resource }}
+            tooltip: Partition for job submission (--partition)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+
+          qos:
+            label: Quality of Service (QoS)
+            type: slurm-qos
+            resource: ${{ inputs.resource }}
+            tooltip: SLURM QoS setting (--qos)
+            optional: true
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+
+          cpus_per_task:
+            type: number
+            label: CPUs per Task
+            min: 1
+            max: 256
+            default: 1
+            tooltip: Number of CPUs for the job (--cpus-per-task)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+
+          time:
+            label: Walltime
+            type: string
+            default: 02:00:00
+            prefillDefault: true
+            tooltip: Maximum job duration, e.g., 02:00:00 (--time)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+
+          gres:
+            label: GPUs (gres)
+            type: dropdown
+            default: "gpu:1"
+            tooltip: GPU resource specification (--gres)
+            options:
+              - value: "gpu:1"
+                label: "1 GPU (gpu:1)"
+              - value: "gpu:2"
+                label: "2 GPUs (gpu:2)"
+              - value: "gpu:4"
+                label: "4 GPUs (gpu:4)"
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+
+          scheduler_directives:
+            type: editor
+            label: Additional Directives
+            optional: true
+            tooltip: Additional SLURM directives (include #SBATCH prefix)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'slurm' }}
+
+      # ========================================================================
+      # PBS Configuration
+      # ========================================================================
+      pbs:
+        type: group
+        label: PBS Configuration
+        hidden: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+        collapsed: true
+        items:
+          is_disabled:
+            type: boolean
+            default: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+            hidden: true
+
+          account:
+            label: Account
+            type: string
+            optional: true
+            tooltip: PBS account for job submission (-A)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+
+          queue:
+            label: Queue
+            type: string
+            optional: true
+            tooltip: PBS queue name (-q)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+
+          walltime:
+            label: Walltime
+            type: string
+            default: 02:00:00
+            prefillDefault: true
+            tooltip: Maximum job duration, e.g., 02:00:00 (-l walltime=)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+
+          select:
+            label: Resource Selection
+            type: string
+            default: "1:ncpus=8:ngpus=1"
+            prefillDefault: true
+            placeholder: "1:ncpus=8:ngpus=1"
+            tooltip: PBS resource selection string (-l select=)
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+
+          scheduler_directives:
+            label: Additional Directives
+            type: editor
+            tooltip: Additional PBS directives (include #PBS prefix)
+            optional: true
+            ignore: ${{ inputs.submit_to_scheduler != true || inputs.resource.schedulerType != 'pbs' }}
+
+      # ========================================================================
+      # Advanced Settings
+      # ========================================================================
+      advanced_settings:
+        type: group
+        label: Advanced Settings
+        collapsed: true
+        items:
+          rundir:
+            label: Run Directory
+            default: ~/pw/activate-physicsnemo
+            type: string
+            tooltip: Directory where the workflow will be deployed
+
+          repository:
+            type: string
+            label: Repository
+            default: https://github.com/parallelworks/activate-physicsnemo.git
+
+          repository_branch:
+            type: string
+            label: Repository Branch
+            default: main
