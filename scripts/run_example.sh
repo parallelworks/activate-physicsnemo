@@ -29,8 +29,7 @@ echo "========================================"
 
 START_TIME=$(date +%s)
 
-# Run the example
-chmod +x "$EXAMPLE_SCRIPT"
+# Run the example (script is mounted read-only, use bash explicitly)
 bash "$EXAMPLE_SCRIPT"
 EXIT_CODE=$?
 

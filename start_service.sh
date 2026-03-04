@@ -14,7 +14,7 @@ source "${SCRIPT_DIR}/lib/functions.sh"
 export RUNMODE=${RUNMODE:-docker}
 export EXAMPLE_MODE=${EXAMPLE_MODE:-curated}
 export EXAMPLE_NAME=${EXAMPLE_NAME:-darcy_fno}
-export DOCKER_IMAGE=${DOCKER_IMAGE:-nvcr.io/nvidia/physicsnemo/physicsnemo:25.11}
+export DOCKER_IMAGE=${DOCKER_IMAGE:-nvcr.io/nvidia/physicsnemo/physicsnemo:25.06}
 export GPU_ID=${GPU_ID:-0}
 export MAX_EPOCHS=${MAX_EPOCHS:-0}
 export BATCH_SIZE=${BATCH_SIZE:-0}
@@ -48,24 +48,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Ensure containerd and docker daemons are running
+if sudo -n true 2>/dev/null; then
+    sudo systemctl start containerd 2>/dev/null || true
+    sudo systemctl start docker 2>/dev/null || true
+    sleep 2
+fi
+
 # Determine docker command prefix (sudo or not)
 DOCKER_CMD="docker"
-if ! docker ps >/dev/null 2>&1; then
+if sudo -n docker ps >/dev/null 2>&1; then
+    DOCKER_CMD="sudo docker"
+elif ! docker ps >/dev/null 2>&1; then
     if [[ "$RUNMODE" == "rootless" ]]; then
         start_rootless_docker
-    elif sudo -n true 2>/dev/null; then
-        sudo systemctl start docker 2>/dev/null || true
-        DOCKER_CMD="sudo docker"
     else
         error "Cannot access Docker. Try rootless mode or ensure Docker is running."
         exit 1
-    fi
-else
-    # Check if we need sudo for GPU access
-    if ! docker run --rm --gpus device=0 hello-world >/dev/null 2>&1; then
-        if sudo -n true 2>/dev/null; then
-            DOCKER_CMD="sudo docker"
-        fi
     fi
 fi
 
