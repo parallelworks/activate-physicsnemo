@@ -119,9 +119,11 @@ jobs:
             error "Docker is not installed"
             ERRORS=$((ERRORS + 1))
           else
-            # Try to start docker daemon if we have sudo
+            # Try to start containerd and docker daemons if we have sudo
             if sudo -n true 2>/dev/null; then
+              sudo systemctl start containerd 2>/dev/null || true
               sudo systemctl start docker 2>/dev/null || true
+              sleep 2
             fi
             if docker ps >/dev/null 2>&1 || sudo -n docker ps >/dev/null 2>&1; then
               info "Docker is accessible"
@@ -194,12 +196,17 @@ jobs:
           IMAGE="${{ inputs.container.docker_image }}"
           info "Pulling container image: $IMAGE"
 
+          # Ensure containerd and docker daemons are running
+          if sudo -n true 2>/dev/null; then
+            sudo systemctl start containerd 2>/dev/null || true
+            sudo systemctl start docker 2>/dev/null || true
+            sleep 2
+          fi
+
           # Determine docker command - prefer sudo for pull reliability
           DOCKER_CMD="docker"
           if sudo -n docker ps >/dev/null 2>&1; then
             DOCKER_CMD="sudo docker"
-            # Ensure docker daemon is running
-            sudo systemctl start docker 2>/dev/null || true
           elif ! docker ps >/dev/null 2>&1; then
             error "Docker is not accessible"
             exit 1
@@ -562,7 +569,7 @@ jobs:
           docker_image:
             type: string
             label: Docker Image
-            default: nvcr.io/nvidia/physicsnemo/physicsnemo:25.11
+            default: nvcr.io/nvidia/physicsnemo/physicsnemo:25.06
             prefillDefault: true
             tooltip: PhysicsNemo container image to use
 
