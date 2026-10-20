@@ -280,7 +280,7 @@ jobs:
 
           TB_PORT="${{ inputs.tensorboard.port }}"
           TB_BACKEND_PORT=6007
-          DOCKER_IMAGE="${{ inputs.container.image }}"
+          DOCKER_IMAGE="${{ inputs.container.docker_image }}"
           CONTAINER_NAME="tb-session-$$"
 
           SESSION_NAME="${{ sessions.session }}"
